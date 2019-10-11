@@ -1,0 +1,316 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+
+Parameters:
+  EnvName:
+    Type: String
+    Default: staging
+    AllowedValues:
+      - staging
+      - prod
+    Description: Environment name
+  AdminEmail:
+    Type: String
+    Description: "Administrator e-mail, for SNS notifications"
+
+
+Globals:
+  Function:
+    Timeout: 3
+    Runtime: python3.7
+    Handler: app.lambda_handler
+    Environment:
+      Variables:
+        LOG_LEVEL: DEBUG
+
+Resources:
+  GetLambda:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: get_s3_presigned_url/
+      Policies:
+        # AWSLambdaBasicExecutionRole gets attached automatically
+        - DynamoDBReadPolicy:
+            TableName: !Ref StateTable
+        - S3ReadPolicy:
+            BucketName: !Ref UploadsS3
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action:
+                - states:startExecution
+              Resource: !Ref GetStepFunction
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref StateTable
+          S3_BUCKET: !Ref UploadsS3
+          STATE_MACHINE_ARN: !Ref GetStepFunction
+
+  Api:
+    Type: AWS::Serverless::Api
+    Properties:
+      Name: serverless-share-s3object-onetime
+      EndpointConfiguration: REGIONAL
+      StageName: staging
+      DefinitionBody:
+        swagger: '2.0'
+        info:
+          version: '2016-10-13T23:04:43Z'
+          title: serverless-share-s3object-onetime
+        schemes:
+        - https
+        paths:
+          "/{item}":
+            get:
+              produces:
+              - application/json
+              parameters:
+              - name: hash
+                in: query
+                required: true
+                type: string
+              - name: item
+                in: path
+                required: true
+                type: string
+              - name: alias
+                in: query
+                required: true
+                type: string
+              responses:
+                '200':
+                  description: 200 response
+                  schema:
+                    "$ref": "#/definitions/Empty"
+                  headers:
+                    content-type:
+                      type: string
+                    Content-Type:
+                      type: string
+                '302':
+                  description: 302 response
+                '400':
+                  description: 400 response
+                '500':
+                  description: 500 response
+              x-amazon-apigateway-integration:
+                credentials: !GetAtt ApiRole.Arn
+                uri:
+                  Fn::Sub: arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${GetLambda.Arn}/invocations
+                responses:
+                  default:
+                    statusCode: '200'
+                passthroughBehavior: when_no_match
+                httpMethod: POST
+                contentHandling: CONVERT_TO_TEXT
+                type: aws_proxy
+        definitions:
+          Empty:
+            type: object
+            title: Empty Schema
+
+  GetStepFunction:
+    Type: 'AWS::StepFunctions::StateMachine'
+    Properties:
+      DefinitionString: !Sub |
+        {
+          "Comment": "A Retry example of the Amazon States Language using an AWS Lambda Function",
+          "TimeoutSeconds": 180,
+          "StartAt": "IsOneTime",
+          "States": {
+            "IsOneTime": {
+              "Type": "Choice",
+              "Choices": [
+                {
+                  "Variable": "$.is_onetime",
+                  "BooleanEquals": false,
+                  "Next": "NotifySuccess"
+                },
+                {
+                  "Variable": "$.is_onetime",
+                  "BooleanEquals": true,
+                  "Next": "MakeExpire"
+                }
+              ]
+            },
+            "MakeExpire": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::dynamodb:updateItem",
+              "Parameters": {
+                "TableName": "${StateTable}",
+                "Key": {
+                  "Hash": {"S.$": "$.hash"},
+                  "S3Key": {"S.$": "$.s3_key"}
+                },
+                "ExpressionAttributeValues" : {
+                  ":epoch_now": {"N.$": "$.epoch_now"}
+                },
+                "UpdateExpression": "SET Expires = :epoch_now"
+              },
+              "ResultPath": "$.DynamoDB",
+              "Retry": [
+                {
+                  "ErrorEquals": [
+                    "DynamoDB.ProvisionedThroughputExceededException",
+                    "DynamoDB.RequestLimitExceeded",
+                    "DynamoDB.ThrottlingException",
+                    "DynamoDB.InternalServerError"
+                  ],
+                  "IntervalSeconds": 2,
+                  "BackoffRate": 3.0,
+                  "MaxAttempts": 5
+                }
+              ],
+              "Catch": [
+                  {
+                    "ErrorEquals": [ "States.ALL" ],
+                    "ResultPath": "$.Error",
+                    "Next": "NotifyFailure"
+                  }
+              ],
+              "Next": "NotifySuccess"
+            },
+            "NotifyFailure": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::sns:publish",
+              "Parameters": {
+                "TopicArn": "${NotificationsTopic}",
+                "Message.$": "$.Error",
+                "Subject": "[ERROR] Successfully requested, but failed to expire one-time link"
+              },
+              "ResultPath": "$.SNS",
+              "Next": "Failure"
+            },
+            "NotifySuccess": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::sns:publish",
+              "Parameters": {
+                "TopicArn": "${NotificationsTopic}",
+                "Subject": "[INFO] Successfully requested",
+                "Message.$": "$.success_message"
+              },
+              "ResultPath": "$.SNS",
+              "End": true
+            },
+            "Failure": {
+              "Type": "Fail"
+            }
+          }
+        }
+      RoleArn: !GetAtt GetStepFunctionRole.Arn
+
+  UploadsS3:
+    Type: AWS::S3::Bucket
+
+  StateTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      AttributeDefinitions:
+        -
+          AttributeName: "Hash"
+          AttributeType: "S"
+        -
+          AttributeName: "S3Key"
+          AttributeType: "S"
+      KeySchema:
+        -
+          AttributeName: "Hash"
+          KeyType: "HASH"
+        -
+          AttributeName: "S3Key"
+          KeyType: "RANGE"
+      ProvisionedThroughput:
+        ReadCapacityUnits: 5
+        WriteCapacityUnits: 5
+      StreamSpecification:
+        StreamViewType: "NEW_AND_OLD_IMAGES"
+      TimeToLiveSpecification:
+        AttributeName: "Expires"
+        Enabled: true
+
+  ApiRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - apigateway.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Path: "/"
+
+  ApiRolePolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: api-role-policy
+      Roles:
+        - !Ref ApiRole
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - 'lambda:InvokeFunction'
+            Resource:
+              - !GetAtt GetLambda.Arn
+
+  GetStepFunctionRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: "Allow"
+            Principal:
+              Service:
+                - !Sub states.${AWS::Region}.amazonaws.com
+            Action: "sts:AssumeRole"
+      Path: "/"
+      Policies:
+        - PolicyName: StatesExecutionPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - "sns:Publish"
+                Resource:
+                  - !Ref NotificationsTopic
+              - Effect: Allow
+                Action:
+                  - "dynamodb:UpdateItem"
+                Resource:
+                  - !GetAtt StateTable.Arn
+                # Fine-Grained Access Control: UpdateItem can update only "Expires" attribute
+                # HASH and RANGE can't be updated, but must be declared in dynamodb:Attributes
+                Condition:
+                  ForAllValues:StringEquals:
+                    dynamodb:Attributes:
+                    - "Hash"
+                    - "S3Key"
+                    - "Expires"
+                  StringEqualsIfExists:
+                    dynamodb:Select: SPECIFIC_ATTRIBUTES
+                    dynamodb:ReturnValues:
+                    - NONE
+                    - UPDATED_OLD
+                    - UPDATED_NEW
+
+
+  NotificationsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      Subscription:
+        - Endpoint: !Ref AdminEmail
+          Protocol: "email"
+
+
+Outputs:
+  ApiUrl:
+    Description: API Gateway Stage URL
+    Value: !Sub 'https://${Api}.execute-api.${AWS::Region}.amazonaws.com/${EnvName}/'
+  UploadsBucketName:
+    Value: !Ref UploadsS3

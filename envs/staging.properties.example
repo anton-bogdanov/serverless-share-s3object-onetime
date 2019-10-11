@@ -1,0 +1,3 @@
+ENV_NAME='staging'
+SAM_S3_BUCKET='staging-awssam-packages'
+ADMIN_EMAIL='foo@example.com'
